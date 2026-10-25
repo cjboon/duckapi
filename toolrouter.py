@@ -24,6 +24,7 @@ matches, we return None and the request flows to Duck.ai as a normal chat.
 from __future__ import annotations
 
 import os
+import json
 import re
 from dataclasses import dataclass
 from typing import List, Optional
@@ -211,3 +212,94 @@ def has_tool_result(messages: List[dict]) -> bool:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Protocol injection (agent upgrade, step 2).
+# Duck.ai models cannot call tools natively. When an agent client advertises
+# tools, we append a compact protocol block to the END of the flattened
+# prompt: duckai._clamp_prompt keeps the head 10% and tail 90%, so protocol
+# instructions placed last always survive into the live context. The actual
+# envelopes the model emits are parsed by tools.parse_tool_calls (step 3
+# converts them into client-shaped tool_calls).
+# ---------------------------------------------------------------------------
+
+CLOSE_TAG = "<" + "/" + "tool_call" + ">"
+
+
+def _first_sentence(text: str, cap: int = 140) -> str:
+    """Compact a tool description to one colon-free, fence-free sentence."""
+    s = " ".join(str(text or "").split())
+    for cut in (". ", ".\n", "! ", "? "):
+        idx = s.find(cut)
+        if 0 < idx < cap:
+            s = s[: idx + 1]
+            break
+    if len(s) > cap:
+        s = s[: cap - 1].rstrip() + "…"
+    return s.replace('"', "'")
+
+
+def _tool_entry(t: dict) -> dict:
+    """Normalize OpenAI ({type:function,...}) and Anthropic ({name,...}) shapes."""
+    fn = t.get("function") if isinstance(t.get("function"), dict) else t
+    name = fn.get("name")
+    schema = fn.get("parameters") if "parameters" in fn else fn.get("input_schema")
+    return {"name": name, "desc": fn.get("description", ""), "schema": schema}
+
+
+def _render_tool(entry: dict) -> str:
+    lines = [f"- {entry['name']}: {_first_sentence(entry['desc'])}"]
+    schema = entry.get("schema")
+    if isinstance(schema, dict) and schema:
+        try:
+            lines.append(
+                "  schema: " + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+            )
+        except (TypeError, ValueError):
+            lines.append("  schema: <unrenderable>")
+    return "\n".join(lines)
+
+
+def render_tool_block(tools: list) -> str:
+    """Compact 'Tools' + protocol section for appending to a Duck.ai prompt."""
+    entries = [_tool_entry(t) for t in (tools or [])]
+    entries = [e for e in entries if e["name"]]
+    if not entries:
+        return ""
+    rendered, total = [], 0
+    cap = 6000
+    for e in entries:
+        chunk = _render_tool(e)
+        if total + len(chunk) > cap:
+            break
+        rendered.append(chunk)
+        total += len(chunk)
+    body = "\n".join(rendered)
+    note = "  (some tools omitted for space)\n" if len(rendered) < len(entries) else ""
+    return (
+        "## Using tools\n\n"
+        "You may request the caller to execute a tool by replying with "
+        f"envelopes in EXACTLY this format:\n\n"
+        f'<tool_call name="TOOL_NAME">\n'
+        '{"argument": "value"}\n'
+        f"{CLOSE_TAG}\n\n"
+        "Rules:\n"
+        "- Use ONLY the tools listed below, with the exact argument names shown.\n"
+        "- The inside of each envelope must be exactly one valid JSON object.\n"
+        "- You may emit several envelopes in one reply to chain steps.\n"
+        "- No commentary inside envelopes; keep any preface text before the first one.\n"
+        "- If the latest [tool_result] already answers the user, reply directly "
+        "and stop using envelopes.\n"
+        "- If no tool is needed, just answer normally with no envelope.\n\n"
+        "Tools:\n"
+        f"{body}\n{note}"
+    )
+
+
+def build_tool_aware_prompt(base_prompt: str, tools: list) -> str:
+    """base conversation prompt + tool-protocol block (empty block = unchanged)."""
+    block = render_tool_block(tools)
+    if not block:
+        return base_prompt
+    return base_prompt.rstrip() + "\n\n" + block.rstrip() + "\n"
