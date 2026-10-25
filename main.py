@@ -47,8 +47,8 @@ from duckai import (
     fetch_model_catalog,
     resolve_model,
 )
-from tools import split_text_and_tool
-from toolrouter import has_tool_result, route_intent
+from tools import split_text_and_tools
+from toolrouter import build_tool_aware_prompt, has_tool_result, route_intent
 
 load_dotenv()
 
@@ -426,6 +426,47 @@ async def _openai_stream(session: DuckAISession, prompt: str, model: str, chat_i
         err = {"error": {"message": f"stream failed: {e}", "type": "server_error"}}
         yield f"data: {json.dumps(err)}\n\n"
 
+async def _openai_agent_stream(session: DuckAISession, prompt: str, model: str, chat_id: str, rewrite: Optional[dict] = None):
+    """Buffered OpenAI stream for tool-aware requests.
+
+    Duck.ai output is parsed for tool-call envelopes BEFORE any chunk is sent,
+    so a half-received envelope can never leak into the transcript as plain
+    text (which made clients show '<tool_call ...' as ordinary prose). Cost:
+    first visible chunk arrives only after the model finishes; acceptable at
+    the relay's multi-second turn latency.
+    """
+    def chunk_obj(delta: dict, finish):
+        return {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": _created(),
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+
+    buf: List[str] = []
+    try:
+        async for token in session.send_stream(prompt, rewrite=rewrite):
+            buf.append(token)
+    except (DuckAIRateLimit, DuckAIError) as e:
+        yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'server_error'}})}\n\n"
+        return
+    except Exception as e:  # noqa: BLE001
+        yield f"data: {json.dumps({'error': {'message': f'stream failed: {e}', 'type': 'server_error'}})}\n\n"
+        return
+
+    preamble, calls = split_text_and_tools("".join(buf))
+    # Strict OpenAI clients expect the first chunk's delta to carry role.
+    yield f"data: {json.dumps(chunk_obj({'role': 'assistant'}, None))}\n\n"
+    if calls:
+        for tc in calls:
+            yield f"data: {json.dumps(chunk_obj({'tool_calls': [{'index': 0, 'id': f'call_{uuid4().hex[:24]}', 'type': 'function', 'function': {'name': tc.name, 'arguments': json.dumps(tc.input, ensure_ascii=False)}}]}, None))}\n\n"
+        yield f"data: {json.dumps(chunk_obj({}, 'tool_calls'))}\n\n"
+    else:
+        yield f"data: {json.dumps(chunk_obj({'content': preamble}, None))}\n\n"
+        yield f"data: {json.dumps(chunk_obj({}, 'stop'))}\n\n"
+    yield "data: [DONE]\n\n"
+
 @app.post("/v1/chat/completions", dependencies=[Depends(require_key)])
 async def chat_completions(request: ChatCompletionRequest):
     system = None
@@ -436,6 +477,9 @@ async def chat_completions(request: ChatCompletionRequest):
         else:
             turns.append({"role": m.role, "content": m.content})
     prompt = flatten_conversation(system, turns)
+    # Teach Duck.ai the envelope protocol when the client advertises tools;
+    # block goes last so head+tail truncation keeps it in the live context.
+    agent_prompt = build_tool_aware_prompt(prompt, request.tools or [])
     if not prompt.strip() and not request.tools:
         raise HTTPException(status_code=400, detail="empty prompt")
     model = resolve_model(request.model)
@@ -484,26 +528,36 @@ async def chat_completions(request: ChatCompletionRequest):
     rewrite = build_rewrite(model=model, reasoning_effort=request.reasoning_effort, duckai=request.duckai)
 
     if request.stream:
+        # Tool-aware requests use the buffered stream (envelopes parsed before
+        # anything is emitted); plain chat keeps token-by-token streaming.
+        if request.tools:
+            return StreamingResponse(
+                _openai_agent_stream(session, agent_prompt, model, _id(), rewrite),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
         return StreamingResponse(
             _openai_stream(session, prompt, model, _id(), rewrite), media_type="text/event-stream"
         )
 
     try:
-        result = await session.send(prompt, rewrite=rewrite)
+        result = await session.send(agent_prompt, rewrite=rewrite)
     except DuckAIRateLimit as e:
         raise HTTPException(status_code=429, detail=str(e))
     except DuckAIError as e:
         raise HTTPException(status_code=502, detail=str(e))
-    msg = {"role": "assistant", "content": result.strip()}
+    preamble, calls = split_text_and_tools(result)
+    msg = {"role": "assistant", "content": (preamble or (None if calls else ""))}
     finish = "stop"
-    preamble, tc = split_text_and_tool(result)
-    if tc is not None:
-        msg["content"] = preamble or None
-        msg["tool_calls"] = [{
-            "id": f"call_{uuid4().hex[:24]}",
-            "type": "function",
-            "function": {"name": tc.name, "arguments": json.dumps(tc.input, ensure_ascii=False)},
-        }]
+    if calls:
+        msg["tool_calls"] = [
+            {
+                "id": f"call_{uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": tc.name, "arguments": json.dumps(tc.input, ensure_ascii=False)},
+            }
+            for tc in calls
+        ]
         finish = "tool_calls"
     return {
         "id": _id(),
@@ -552,6 +606,9 @@ async def openai_responses(request: Request):
     model = resolve_model(raw.get("model"))
     tools = raw.get("tools") or []
     prompt = _responses_input_text(raw.get("input"))
+    base_prompt = prompt
+    # Protocol injection goes last in the flattened prompt (see chat endpoint).
+    prompt = build_tool_aware_prompt(prompt, tools)
     # Relay-side tool routing: synthesise a function_call from the user's intent.
     if TOOL_ROUTING and tools:
         resp_items = raw.get("input") or []
@@ -583,7 +640,7 @@ async def openai_responses(request: Request):
                     }],
                     "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                 }
-    if not prompt:
+    if not base_prompt:
         raise HTTPException(status_code=400, detail="empty input")
     stream = bool(raw.get("stream", False))
     session = await get_session(model)
@@ -602,7 +659,7 @@ async def openai_responses(request: Request):
             raise HTTPException(status_code=429, detail=str(e))
         except DuckAIError as e:
             raise HTTPException(status_code=502, detail=str(e))
-        preamble, tc = split_text_and_tool(result)
+        preamble, calls = split_text_and_tools(result)
         output = []
         if preamble:
             output.append({
@@ -611,10 +668,11 @@ async def openai_responses(request: Request):
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": preamble}],
             })
-        if tc is not None:
+        for tc in calls:
             output.append({
                 "type": "function_call",
                 "id": f"fc_{uuid4().hex[:24]}",
+                "call_id": f"call_{uuid4().hex[:24]}",
                 "name": tc.name,
                 "arguments": json.dumps(tc.input, ensure_ascii=False),
             })
@@ -636,17 +694,49 @@ async def openai_responses(request: Request):
         }
 
     async def _resp_stream():
+        # Buffered like the chat endpoint: parse envelopes before emitting.
         yield f"data: {json.dumps({'type': 'response.created', 'response': {'id': resp_id, 'object': 'response', 'status': 'in_progress', 'model': model, 'output': []}})}\n\n"
+        buf = []
         try:
             async for token in session.send_stream(prompt, rewrite=rewrite):
-                yield f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': token})}\n\n"
+                buf.append(token)
         except (DuckAIRateLimit, DuckAIError) as e:
             yield f"data: {json.dumps({'type': 'error', 'error': {'message': str(e), 'type': 'server_error'}})}\n\n"
             return
         except Exception as e:  # noqa: BLE001
             yield f"data: {json.dumps({'type': 'error', 'error': {'message': f'stream failed: {e}', 'type': 'server_error'}})}\n\n"
             return
-        yield f"data: {json.dumps({'type': 'response.completed', 'response': {'id': resp_id, 'object': 'response', 'status': 'completed', 'model': model, 'output': []}})}\n\n"
+        preamble, calls = split_text_and_tools("".join(buf))
+        final_output = []
+        if calls or preamble:
+            if preamble:
+                item = {
+                    "type": "message",
+                    "id": f"msg_{uuid4().hex[:24]}",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": preamble}],
+                }
+                final_output.append(item)
+                yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': 0, 'item': item})}\n\n"
+            for tc in calls:
+                call_id = f"call_{uuid4().hex[:24]}"
+                item = {
+                    "type": "function_call",
+                    "id": f"fc_{uuid4().hex[:24]}",
+                    "call_id": call_id,
+                    "name": tc.name,
+                    "arguments": json.dumps(tc.input, ensure_ascii=False),
+                }
+                final_output.append(item)
+                yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': len(final_output) - 1, 'item': item})}\n\n"
+                yield f"data: {json.dumps({'type': 'response.function_call_arguments.delta', 'item_id': item['id'], 'delta': item['arguments']})}\n\n"
+        else:
+            text_out = "".join(buf)
+            if text_out.strip():
+                yield f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': text_out})}\n\n"
+                final_output.append({"type": "message", "id": f"msg_{uuid4().hex[:24]}", "role": "assistant",
+                                     "content": [{"type": "output_text", "text": text_out.strip()}]})
+        yield f"data: {json.dumps({'type': 'response.completed', 'response': {'id': resp_id, 'object': 'response', 'status': 'completed', 'model': model, 'output': final_output}})}\n\n"
 
     return StreamingResponse(_resp_stream(), media_type="text/event-stream")
 
@@ -676,8 +766,8 @@ def _build_anthropic_message(msg_id: str, model: str, result: str, tool_use=None
             "stop_sequence": None,
             "usage": {"input_tokens": 0, "output_tokens": 0},
         }
-    preamble, tc = split_text_and_tool(result)
-    if tc is None:
+    preamble, calls = split_text_and_tools(result)
+    if not calls:
         return {
             "id": msg_id,
             "type": "message",
@@ -691,12 +781,13 @@ def _build_anthropic_message(msg_id: str, model: str, result: str, tool_use=None
     content = []
     if preamble:
         content.append({"type": "text", "text": preamble})
-    content.append({
-        "type": "tool_use",
-        "id": f"toolu_{uuid4().hex[:24]}",
-        "name": tc.name,
-        "input": tc.input,
-    })
+    for tc in calls:
+        content.append({
+            "type": "tool_use",
+            "id": f"toolu_{uuid4().hex[:24]}",
+            "name": tc.name,
+            "input": tc.input,
+        })
     return {
         "id": msg_id,
         "type": "message",
@@ -758,6 +849,7 @@ async def anthropic_messages(request: Request):
     tools = raw.get("tools") or []
     messages = raw.get("messages") or []
     prompt = build_anthropic_prompt(system, messages)
+    prompt = build_tool_aware_prompt(prompt, tools)
     # Relay-side tool routing: Duck.ai cannot emit tool calls, so the relay
     # synthesizes a tool_use block from the user's intent. Skip routing when the
     # client is already returning a tool_result (mid-loop) - then we just answer.
@@ -825,6 +917,78 @@ async def anthropic_messages(request: Request):
         })
         yield _sse("message_stop", {"type": "message_stop"})
 
+    async def _anthropic_agent_stream():
+        # Buffered like the OpenAI agent stream: envelopes are parsed BEFORE
+        # anything is emitted, so partial tool-call markup can never leak into
+        # the transcript as plain text.
+        yield _sse("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        })
+        buf: List[str] = []
+        try:
+            async for token in session.send_stream(prompt, rewrite=rewrite):
+                buf.append(token)
+        except (DuckAIRateLimit, DuckAIError) as e:
+            yield _sse("error", {"type": "error", "error": {"type": "rate_limit_error", "message": str(e)}})
+            return
+        except Exception as e:  # noqa: BLE001
+            yield _sse("error", {"type": "error", "error": {"type": "api_error", "message": f"stream failed: {e}"}})
+            return
+        preamble, calls = split_text_and_tools("".join(buf))
+        index = 0
+        if preamble:
+            yield _sse("content_block_start", {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "text", "text": ""},
+            })
+            yield _sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "text_delta", "text": preamble},
+            })
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": index})
+            index += 1
+        for tc in calls:
+            yield _sse("content_block_start", {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": f"toolu_{uuid4().hex[:24]}",
+                    "name": tc.name,
+                    "input": {},
+                },
+            })
+            yield _sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "input_json_delta",
+                          "partial_json": json.dumps(tc.input, ensure_ascii=False)},
+            })
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": index})
+            index += 1
+        yield _sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use" if calls else "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 0},
+        })
+        yield _sse("message_stop", {"type": "message_stop"})
+
+    # Tool-aware requests use the buffered stream (envelopes parsed before
+    # anything is emitted); plain chat keeps token-by-token streaming.
+    if tools:
+        return StreamingResponse(_anthropic_agent_stream(), media_type="text/event-stream")
     return StreamingResponse(_anthropic_stream(), media_type="text/event-stream")
 
 
