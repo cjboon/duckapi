@@ -96,6 +96,8 @@ NEW_CHAT = os.getenv("DUCKAI_NEW_CHAT", "0").strip() == "1"
 # the IDE reports "no response from model"). Off by default; opt in per deploy.
 TOOL_ROUTING = os.getenv("DUCKAI_TOOL_ROUTING", "0").strip() == "1"
 PORT = int(os.getenv("PORT", "8080"))
+TOOL_RESULT_CAP = int(os.getenv("DUCKAI_TOOL_RESULT_CAP", "3000"))
+HOST = os.getenv("DUCKAI_HOST", "127.0.0.1")
 _BOOT_TS = time.time()
 _active_requests = 0
 
@@ -144,8 +146,9 @@ def _anthropic_block_text(content: Any) -> str:
                 elif btype == "tool_use":
                     # replay the model's prior call so context stays consistent
                     parts.append(
-                        f'[tool_call name="{block.get("name","")}"] '
-                        f"{json.dumps(block.get('input',{}), ensure_ascii=False)}"
+                        f'<tool_call name="{block.get("name","")}">\n'
+                        f"{json.dumps(block.get('input',{}), ensure_ascii=False)}\n"
+                        "</tool_call>"
                     )
                 elif btype == "input_json_delta" and "partial_json" in block:
                     parts.append(block.get("partial_json", ""))
@@ -389,6 +392,8 @@ class ChatMessage(BaseModel):
     # Agent clients (OpenCode/Claude Code) send assistant history with
     # content: null when the turn carried tool_calls; accept that shape.
     content: Optional[Union[str, List[Any]]] = None
+    tool_calls: Optional[List[dict]] = None
+    tool_call_id: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -459,8 +464,10 @@ async def _openai_agent_stream(session: DuckAISession, prompt: str, model: str, 
     # Strict OpenAI clients expect the first chunk's delta to carry role.
     yield f"data: {json.dumps(chunk_obj({'role': 'assistant'}, None))}\n\n"
     if calls:
-        for tc in calls:
-            yield f"data: {json.dumps(chunk_obj({'tool_calls': [{'index': 0, 'id': f'call_{uuid4().hex[:24]}', 'type': 'function', 'function': {'name': tc.name, 'arguments': json.dumps(tc.input, ensure_ascii=False)}}]}, None))}\n\n"
+        if preamble:
+            yield f"data: {json.dumps(chunk_obj({'content': preamble}, None))}\n\n"
+        for i, tc in enumerate(calls):
+            yield f"data: {json.dumps(chunk_obj({'tool_calls': [{'index': i, 'id': f'call_{uuid4().hex[:24]}', 'type': 'function', 'function': {'name': tc.name, 'arguments': json.dumps(tc.input, ensure_ascii=False)}}]}, None))}\n\n"
         yield f"data: {json.dumps(chunk_obj({}, 'tool_calls'))}\n\n"
     else:
         yield f"data: {json.dumps(chunk_obj({'content': preamble}, None))}\n\n"
@@ -469,13 +476,24 @@ async def _openai_agent_stream(session: DuckAISession, prompt: str, model: str, 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_key)])
 async def chat_completions(request: ChatCompletionRequest):
-    system = None
+    systems = []
     turns = []
     for m in request.messages:
+        text = _anthropic_block_text(m.content)
         if m.role == "system":
-            system = m.content
-        else:
-            turns.append({"role": m.role, "content": m.content})
+            if text.strip():
+                systems.append(text)
+            continue
+        # Replay the model's earlier tool calls in the same envelope format it is
+        # asked to emit, so it can see what produced each [tool_result].
+        for tc in m.tool_calls or []:
+            fn = tc.get("function") or {}
+            args = fn.get("arguments") or "{}"
+            text += f'\n<tool_call name="{fn.get("name", "")}">\n{args}\n</tool_call>'
+        if m.role == "tool" and len(text) > TOOL_RESULT_CAP:
+            text = text[:TOOL_RESULT_CAP] + "\n...[tool output truncated]"
+        turns.append({"role": m.role, "content": text.strip(), "tool_call_id": m.tool_call_id or ""})
+    system = "\n\n".join(systems) or None
     prompt = flatten_conversation(system, turns)
     # Teach Duck.ai the envelope protocol when the client advertises tools;
     # block goes last so head+tail truncation keeps it in the live context.
@@ -1089,4 +1107,4 @@ async def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host=HOST, port=PORT)

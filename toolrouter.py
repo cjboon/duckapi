@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import List, Optional
@@ -268,7 +269,7 @@ def render_tool_block(tools: list) -> str:
     if not entries:
         return ""
     rendered, total = [], 0
-    cap = 6000
+    cap = int(os.getenv("DUCKAI_TOOL_BLOCK_CAP", "6000"))
     for e in entries:
         chunk = _render_tool(e)
         if total + len(chunk) > cap:
@@ -276,6 +277,13 @@ def render_tool_block(tools: list) -> str:
         rendered.append(chunk)
         total += len(chunk)
     body = "\n".join(rendered)
+    # [patch_toolrouter] log omitted tools
+    if len(rendered) < len(entries):
+        logging.getLogger("duckai2api").warning(
+            "tool block capped at %d chars: %d of %d tools omitted (%s)",
+            cap, len(entries) - len(rendered), len(entries),
+            ", ".join(str(e["name"]) for e in entries[len(rendered):]),
+        )
     note = "  (some tools omitted for space)\n" if len(rendered) < len(entries) else ""
     return (
         "## Using tools\n\n"

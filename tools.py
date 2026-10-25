@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 _TOOL_CALL_RE = re.compile(
     r"<tool_call\s+name=\"([^\"]+)\"\s*>(.*?)</tool_call>", re.DOTALL
@@ -127,3 +127,66 @@ def split_text_and_tools(text: str) -> tuple:
         preamble = preamble[: m.start()] + preamble[m.end():]
     calls.reverse()  # restore original order
     return preamble.strip(), calls
+
+
+# --- tolerant parser (patch_duckapi) ---
+# Overrides the earlier definitions: a missing </tool_call>, fenced JSON, quote
+# style on the name attribute, and '>' inside JSON values are all handled.
+_OPEN_RE = re.compile(r"<tool_call\s+name\s*=\s*[\"']?([\w.\-:]+)[\"']?\s*>", re.I)
+
+
+def _balanced_json(s: str):
+    """Return (obj, consumed_chars) for the first balanced JSON object, else (None, 0)."""
+    start = s.find("{")
+    if start < 0:
+        return None, 0
+    if re.sub(r"[`\s]|json", "", s[:start], flags=re.I):
+        return None, 0  # unexpected text between the tag and the JSON
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(s[start:i + 1]), i + 1
+                except json.JSONDecodeError:
+                    return None, 0
+    return None, 0
+
+
+def split_text_and_tools(text: str) -> tuple:
+    """Split model output into (preamble_text, [ToolCall, ...])."""
+    calls, spans, pos = [], [], 0
+    for m in _OPEN_RE.finditer(text):
+        if m.start() < pos:
+            continue
+        obj, end = _balanced_json(text[m.end():])
+        if obj is None:
+            continue
+        after = m.end() + end
+        close = re.match(r"\s*(?:```\s*)?</tool_call>", text[after:], re.I)
+        if close:
+            after += close.end()
+        calls.append(ToolCall(name=m.group(1), input=obj))
+        spans.append((m.start(), after))
+        pos = after
+    out = text
+    for s, e in reversed(spans):
+        out = out[:s] + out[e:]
+    return out.strip(), calls
+
+
+def parse_tool_calls(text: str) -> List[ToolCall]:
+    return split_text_and_tools(text)[1]

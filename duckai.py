@@ -353,6 +353,8 @@ class _BrowserSession:
         self.banned = False
         # When the current page was opened - drives the warmup poll in _wait_warm.
         self._page_opened_at = 0.0
+        # True for a warmed page that has not carried a send yet (prewarm).
+        self._fresh = False
         # The reused page holds live conversation state, so only one send may drive
         # it at a time; concurrent clients queue instead of clobbering each other.
         self._lock = asyncio.Lock()
@@ -418,6 +420,7 @@ class _BrowserSession:
         await self._wait_warm(page)
         self.page = page
         self._last_prompt = None
+        self._fresh = True
         return page
 
     async def _wait_warm(self, page, budget: float = 7.0) -> None:
@@ -493,14 +496,18 @@ class _BrowserSession:
         if page_alive and not self.new_chat:
             text = self._continuation(prompt)
         if text is None:
-            if page_alive:
-                await self._drop_page()
-            page = await self._open_warmed_page()
+            if page_alive and self._fresh:
+                page = self.page  # prewarmed and never used: keep it
+            else:
+                if page_alive:
+                    await self._drop_page()
+                page = await self._open_warmed_page()
             text = prompt
         else:
             page = self.page
 
         await page.evaluate(_RESET_JS, rewrite if (rewrite and _REWRITE_OK) else None)
+        self._fresh = False
         try:
             await self._trigger_send(page, text)
         except Exception:

@@ -13,3 +13,9 @@ env/
 # OS / editor
 .DS_Store
 Thumbs.db
+.patch-backup/
+*.bak
+*.bak[0-9]
+*.bak.*
+*.before-*
+server.log
