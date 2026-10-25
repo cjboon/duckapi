@@ -386,7 +386,9 @@ def build_rewrite(model: Optional[str] = None, reasoning_effort: Optional[str] =
 # ---------------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: str
-    content: Union[str, List[Any]]
+    # Agent clients (OpenCode/Claude Code) send assistant history with
+    # content: null when the turn carried tool_calls; accept that shape.
+    content: Optional[Union[str, List[Any]]] = None
 
 
 class ChatCompletionRequest(BaseModel):
