@@ -59,11 +59,10 @@ That is the whole install. On first run it creates a virtualenv, installs
 starts uvicorn as a child process, tees output to `server.log` and the console,
 and opens the dashboard once `/health` passes.
 
-Smoke test (`export` is the same line `run.py` prints at startup):
+Smoke test:
 
 ```bash
-export DUCKAI_API_KEY=$(grep '^DUCKAI_API_KEY=' .env | cut -d= -f2-)
-curl -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer $DUCKAI_API_KEY" -d '{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"Say PONG"}]}'
+curl -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer $(grep '^DUCKAI_API_KEY=' .env | cut -d= -f2-)" -d '{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"Say PONG"}]}'
 ```
 
 ---
@@ -75,15 +74,12 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/
    and offers to merge in the relay's provider — naming exactly what would
    be added and asking `[y/N]`. Nothing is written without a yes; a
    timestamped backup is made first; only the relay's own provider/model
-   entries are touched, the rest of the config stays as-is. Already-in-sync
-   configs make this a silent no-op.
-2. Launch opencode with the relay's key exported — the same line `run.py`
-   prints at every start:
-
-   ```bash
-   export DUCKAI_API_KEY=$(grep '^DUCKAI_API_KEY=' /path/to/duckbridge/.env | cut -d= -f2-)
-   ```
-3. Pick a model with `/models` — `duckapi/gpt-5.6-luna` is the registered
+   entries are touched, the rest of the config stays as-is. Your `.env` key
+   is embedded in the merged config, so opencode needs no exported
+   environment variables — and if you ever regenerate the key, the next
+   boot notices and offers to update it. Already-in-sync configs make
+   this a silent no-op.
+2. Pick a model with `/models` — `duckapi/gpt-5.6-luna` is the registered
    default. Opencode's other providers (including its free models) are
    untouched and remain available as usual.
 
@@ -96,7 +92,9 @@ python3 add_opencode_models.py ~/.config/opencode/opencode.jsonc [model-id ...]
 ```
 
 It appends any missing models to the provider whose `baseURL` points at the
-relay's port, with right-sized limits.
+relay's port, with right-sized limits, and embeds the key from `.env` the
+same way. Pass `--env` to keep the `{env:DUCKAI_API_KEY}` placeholder
+instead (the export-one-liner pattern).
 
 Notes on the merged provider:
 

@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import platform
@@ -136,12 +137,17 @@ def opencode_sync(port: int = 8080) -> None:
     The provider block comes from opencode.duck.example.json (single source
     of truth). Merging means: create the 'duckapi' provider, or append the
     missing models to an existing provider already pointed at this relay.
+    The .env key is embedded into the written block, so launching opencode
+    needs no exported environment variable at all - and the offer recurs
+    with consent when an already-embedded key no longer matches .env (e.g.
+    after a key rotation). Placeholder-only, fully-synced configs keep the
+    env-var pattern deliberately and stay silent.
 
-    Consent comes before any write: the prompt says exactly what would be
-    added, [y/N] decides, and a non-interactive terminal only gets the
-    manual command. Already-synced configs make the function a silent no-op,
-    so booting the relay stays quiet. The user's other providers, their
-    default model, and tool settings are never touched.
+    Consent comes before any write: the prompt says exactly what would
+    change, [y/N] decides, and a non-interactive terminal only gets the
+    manual command. Already-synced configs make the function a silent
+    no-op, so booting the relay stays quiet. The user's other providers,
+    their default model, and tool settings are never touched.
     """
     try:
         example = json.loads(OPENCODE_EXAMPLE.read_text(encoding="utf-8"))
@@ -164,20 +170,44 @@ def opencode_sync(port: int = 8080) -> None:
         return
 
     existing = _relay_provider(cfg, port)
+    current_key = _env_value("DUCKAI_API_KEY")
+    placeholder = "{env:DUCKAI_API_KEY}"
     if existing:
         models = cfg["provider"][existing].setdefault("models", {})
         missing = {m: spec for m, spec in wanted.items() if m not in models}
-        if not missing:
+        api_key = str((cfg["provider"][existing].get("options") or {}).get("apiKey") or "")
+        # Embed the .env key unless the config deliberately holds the env-var
+        # pattern with nothing else pending - that user keeps their pattern.
+        embed = bool(current_key) and api_key != current_key and (
+            bool(missing) or api_key != placeholder)
+        if not missing and not embed:
             return  # nothing to do; stay silent on every boot
-        verb = f"add {', '.join(sorted(missing))} to provider '{existing}'"
+        parts = []
+        if missing:
+            parts.append(f"add {', '.join(sorted(missing))} to provider '{existing}'")
+        if embed:
+            parts.append("set its apiKey from .env (so nothing needs exporting)")
 
         def merge():
-            models.update(missing)
+            if missing:
+                models.update(missing)
+            if embed:
+                cfg["provider"][existing].setdefault("options", {})["apiKey"] = current_key
+        verb = " and ".join(parts)
     else:
-        verb = f"register provider 'duckapi' ({', '.join(sorted(wanted))})"
+        if current_key:
+            verb = (f"register provider 'duckapi' ({', '.join(sorted(wanted))}) "
+                    "with your .env key embedded (no environment export needed)")
 
-        def merge():
-            cfg.setdefault("provider", {})["duckapi"] = dict(example_provider)
+            def merge():
+                block = copy.deepcopy(example_provider)
+                block.setdefault("options", {})["apiKey"] = current_key
+                cfg.setdefault("provider", {})["duckapi"] = block
+        else:
+            verb = f"register provider 'duckapi' ({', '.join(sorted(wanted))}) (open access - no key in .env)"
+
+            def merge():
+                cfg.setdefault("provider", {})["duckapi"] = copy.deepcopy(example_provider)
 
     if not sys.stdin.isatty():
         print(f"  opencode  : {path} needs an update ({verb}) - run interactively")
@@ -202,7 +232,8 @@ def opencode_sync(port: int = 8080) -> None:
     merge()
     path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     print(f"  opencode  : merged into {path} (backup: {backup.name})")
-    print("              opencode needs DUCKAI_API_KEY exported at launch (hint printed below).")
+    if current_key:
+        print("              the .env key is embedded in the config now - nothing to export.")
 
 
 _duckapi_ensure_key()
@@ -350,7 +381,9 @@ def serve(py: Path, port: int, reload: bool) -> int:
     print(f"Starting uvicorn on port {port}...")
     print(f"  dashboard : http://localhost:{port}/")
     print("  api key   : stored in .env (DUCKAI_API_KEY); the dashboard tab opens with it filled in")
-    print("  opencode  : export DUCKAI_API_KEY=$(grep '^DUCKAI_API_KEY=' .env | cut -d= -f2-)")
+    print("  opencode  : provider merge embeds the .env key; nothing needs exporting")
+    print("  key export: only for {env:...}-style client configs:")
+    print("              export DUCKAI_API_KEY=$(grep '^DUCKAI_API_KEY=' .env | cut -d= -f2-)")
     print(f"  log file  : {LOG}")
 
     # Truncate rather than append: one run's log is one run's story, and a
