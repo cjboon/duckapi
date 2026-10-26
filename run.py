@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -30,6 +31,7 @@ ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
 LOG = ROOT / "server.log"
 DEFAULT_PORT = 8080
+MIN_PYTHON = (3, 10)  # enforced by check_python()
 
 
 def venv_python() -> Path | None:
@@ -46,19 +48,23 @@ def _duckapi_env_path():
     return Path(__file__).resolve().parent / ".env"
 
 
-def _duckapi_read_key():
-    """The API key the server will use: the environment wins, then .env."""
-    import os
-    key = os.getenv("DUCKAI_API_KEY", "").strip()
-    if key:
-        return key
+def _env_value(name: str) -> str:
+    """Lookup for DUCKAI_* settings: the process environment wins, then .env."""
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
     try:
         for line in _duckapi_env_path().read_text(encoding="utf-8").splitlines():
-            if line.startswith("DUCKAI_API_KEY="):
+            if line.startswith(name + "="):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
     except OSError:
         pass
     return ""
+
+
+def _duckapi_read_key():
+    """The API key the server will use: the environment wins, then .env."""
+    return _env_value("DUCKAI_API_KEY")
 
 
 def _duckapi_ensure_key():
@@ -213,10 +219,80 @@ def port_busy(port: int, host: str = "127.0.0.1") -> bool:
         return s.connect_ex((host, port)) == 0
 
 
+def check_python() -> bool:
+    """False plus a fix-it line when the running Python is older than MIN_PYTHON.
+
+    Uses no 3.10-only *syntax* on purpose: annotations are deferred by the
+    module-level `from __future__ import annotations`, but executable syntax
+    is not - an old `python run.py` must reach this message instead of dying
+    with a SyntaxError before anything is printed.
+    """
+    if sys.version_info >= MIN_PYTHON:
+        return True
+    floor = ".".join(map(str, MIN_PYTHON))
+    print(f"DuckBridge needs Python {floor}+ - found {sys.version.split()[0]}.")
+    print(f"Install a newer Python and rerun (Windows:  py -{floor} run.py).")
+    return False
+
+
+# Standard browser names on PATH and install locations per OS. The relay
+# always drives the user's real Chrome/Chromium - never the browser bundled
+# with Playwright (see duckai.py for why) - so a browser existing is part of
+# setup, and a boot without one must say so plainly.
+BROWSER_NAMES = ("chromium", "chromium-browser", "google-chrome",
+                 "google-chrome-stable", "chrome")
+BROWSER_PATHS = {
+    "Linux": ("/usr/bin/chromium", "/usr/bin/chromium-browser",
+              "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
+              "/snap/bin/chromium", "/opt/google/chrome/google-chrome"),
+    "Darwin": ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+               "/Applications/Chromium.app/Contents/MacOS/Chromium"),
+    "Windows": (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files\Chromium\Application\chrome.exe"),
+}
+
+
+def find_browser() -> tuple[str, str, str]:
+    """Where the browser Playwright will drive comes from. Read-only.
+
+    In order: an explicit DUCKAI_CHROME_PATH (environment, then .env - and it
+    must exist), then PATH, then standard install locations for this OS.
+    Nothing writes anything. The relay still boots when nothing is found,
+    because Playwright has its own channel="chrome" fallback at launch;
+    the failure then surfaces on the first chat request, far less legibly.
+    Returns (level, detail, hint): level is "ok" or "warn", detail is the
+    one banner line, hint is plain multi-line text for warnings.
+    """
+    override = _env_value("DUCKAI_CHROME_PATH")
+    if override:
+        if os.path.exists(override):
+            return "ok", f"{override} (DUCKAI_CHROME_PATH)", ""
+        return "warn", f"{override} (DUCKAI_CHROME_PATH) does not exist", (
+            "fix or remove DUCKAI_CHROME_PATH in .env; standard locations\n"
+            "take over once it is gone.")
+    found = ""
+    for name in BROWSER_NAMES:
+        found = shutil.which(name)
+        if found:
+            break
+    if not found:
+        for candidate in BROWSER_PATHS.get(platform.system(), ()):
+            if os.path.exists(candidate):
+                found = candidate
+                break
+    if found:
+        return "ok", found + " (standard install)", ""
+    return "warn", "no Google Chrome or Chromium found in standard locations", (
+        "the relay still boots, but no chat can run without a browser;\n"
+        "install Chrome or set DUCKAI_CHROME_PATH in .env (example.env).")
+
+
 def ensure_venv() -> Path:
     """Return the venv interpreter, creating it from example.env's requirements
     on first run. Idempotent: an existing venv is reused untouched."""
-    if py := venv_python():
+    py = venv_python()
+    if py:
         return py
 
     print("Creating venv and installing dependencies (first run only)...")
@@ -310,6 +386,9 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="setup + port check only, don't boot")
     args = ap.parse_args()
 
+    if not check_python():
+        return 1
+
     if port_busy(args.port):
         print(f"Port {args.port} is already in use - something else is listening there.")
         print(f"Close it first, or start on another port:  python run.py --port {args.port + 1}")
@@ -318,6 +397,11 @@ def main() -> int:
     ensure_env()
     py = ensure_venv()
     print(f"Interpreter: {py}")
+
+    browser_level, browser_detail, browser_hint = find_browser()
+    print(f"  browser   : {browser_detail}")
+    for hint_line in browser_hint.splitlines():
+        print(f"              {hint_line}")
 
     if args.check:
         print(f"Port {args.port} is free. Setup OK.")

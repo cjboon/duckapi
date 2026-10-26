@@ -34,6 +34,17 @@ extended into an agent-first relay.*
 
 ---
 
+## What you need
+
+- **Python 3.10+** — `run.py` checks this and tells you what to install when
+  it's older. Nothing else needs typing: the venv, the dependencies, and a
+  generated `DUCKAI_API_KEY` are created on first run.
+- **Google Chrome or Chromium, installed** — the relay drives your real
+  browser, never the one bundled with Playwright. A browser in a standard
+  install location is found automatically; a custom location is one line,
+  `DUCKAI_CHROME_PATH` in `.env` (documented in `example.env`). `run.py`
+  prints what it found, and the same scan runs in `python run.py --check`.
+
 ## Quick start
 
 ```bash
