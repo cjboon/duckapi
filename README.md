@@ -15,6 +15,10 @@ and a playground.
 This is unofficial automation of a consumer website. See
 [Cautions](#cautions) before putting traffic through it.
 
+*DuckBridge is adapted from
+[hirotomasato/DuckAI2API](https://github.com/hirotomasato/duckapi) and
+extended into an agent-first relay.*
+
 ---
 
 ## Why this exists
