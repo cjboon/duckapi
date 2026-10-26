@@ -1,9 +1,10 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "model": "duckapi/gpt-5.6-luna",
   "provider": {
-    "duck": {
+    "duckapi": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Duck.ai relay",
+      "name": "DuckAPI",
       "options": {
         "baseURL": "http://127.0.0.1:8080/v1",
         "apiKey": "{env:DUCKAI_API_KEY}"
@@ -12,10 +13,20 @@
         "gpt-5.6-luna": {
           "name": "GPT-5.6 Luna (Duck.ai)",
           "limit": { "context": 12000, "output": 2000 }
+        },
+        "gpt-6-luna": {
+          "name": "GPT-6 Luna",
+          "limit": { "context": 12000, "output": 2000 }
+        },
+        "claude-haiku-4-5": {
+          "name": "claude-haiku-4-5 (Duck.ai)",
+          "limit": { "context": 12000, "output": 2000 }
+        },
+        "mistral-small-2603": {
+          "name": "mistral-small-2603 (Duck.ai)",
+          "limit": { "context": 12000, "output": 2000 }
         }
       }
     }
-  },
-  "model": "duck/gpt-5.6-luna",
-  "tools": { "webfetch": false, "task": false, "todowrite": false, "todoread": false }
+  }
 }

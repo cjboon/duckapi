@@ -287,7 +287,11 @@ def render_tool_block(tools: list) -> str:
     note = "  (some tools omitted for space)\n" if len(rendered) < len(entries) else ""
     return (
         "## Using tools\n\n"
-        "You may request the caller to execute a tool by replying with "
+        "You ARE connected to the user's real project through the tools listed below. "
+        "You CAN read, search and modify files and run commands, but only by emitting "
+        "tool envelopes: the caller executes each one and returns a [tool_result]. "
+        "Never say you cannot access files or lack tools; emit an envelope instead. "
+        "To use a tool, reply with "
         f"envelopes in EXACTLY this format:\n\n"
         f'<tool_call name="TOOL_NAME">\n'
         '{"argument": "value"}\n'
@@ -301,7 +305,12 @@ def render_tool_block(tools: list) -> str:
         "and stop using envelopes.\n"
         "- If no tool is needed, just answer normally with no envelope.\n\n"
         "Tools:\n"
-        f"{body}\n{note}"
+        f"{body}\n{note}\n"
+        "Reminder: you have these tools right now. To look at or change anything in the "
+        "project, emit a tool envelope; do not claim you lack access. "
+"Never describe a change as done before its [tool_result] confirms it, and never repeat a "
+"tool call that already succeeded. Once a [tool_result] shows the task is complete, reply "
+"with one short plain-text summary and NO tool_call.\n"
     )
 
 

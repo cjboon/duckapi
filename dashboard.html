@@ -436,7 +436,13 @@ const dur = (s) => s < 60 ? `${Math.round(s)}s` : `${Math.floor(s/60)}m ${Math.r
 // Same-process proxy, so a configured API key goes out as a Bearer header
 // exactly like any other client would send it.
 async function api(path, opts = {}) {
-  const key = localStorage.getItem('duckapi_key') || '';
+  let key = localStorage.getItem('duckapi_key') || '';
+  // [patch_dashboard] open http://localhost:PORT/#key=YOUR_KEY once to store the key
+  if (location.hash.startsWith('#key=')) {
+    key = decodeURIComponent(location.hash.slice(5));
+    try { localStorage.setItem('duckapi_key', key); } catch (e) {}
+    history.replaceState(null, '', location.pathname + location.search);
+  }
   const headers = Object.assign({}, opts.headers || {});
   if (key) headers['Authorization'] = 'Bearer ' + key;
   const r = await fetch(path, Object.assign({}, opts, { headers }));

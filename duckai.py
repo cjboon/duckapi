@@ -361,7 +361,12 @@ class _BrowserSession:
 
     async def _ensure_ready(self) -> None:
         if self._ready:
-            return
+            if self.browser is None or self.browser.is_connected():
+                return
+            # The browser process died (crash, OOM kill, someone ran `killall chromium`).
+            # Rebuild now instead of failing the request on a dead context.
+            logger.warning("browser is no longer connected; relaunching")
+            await self._reset()
         self._pw = await async_playwright().start()
         launch: dict = {"headless": True, "channel": "chrome"}
         if CHROME_PATH and os.path.exists(CHROME_PATH):
@@ -462,6 +467,26 @@ class _BrowserSession:
         new_text = tail[marks[0].end():].strip()
         return new_text or None
 
+    async def _explain_disabled_composer(self, page) -> None:
+        """The message box is greyed out (consent dialog, usage limit, bot check...).
+        Capture what the page says and fail fast with it instead of a 30s click timeout."""
+        snippet = ""
+        try:
+            snippet = await page.evaluate(
+                "() => (document.body.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 600)"
+            )
+        except Exception:
+            pass
+        shot = ""
+        try:
+            os.makedirs("debug", exist_ok=True)
+            await page.screenshot(path="debug/composer-disabled.png")
+            shot = " (screenshot: debug/composer-disabled.png)"
+        except Exception:
+            pass
+        logger.warning("duck.ai message box is disabled%s; page text: %s", shot, snippet)
+        raise DuckAIError("duck.ai message box is disabled%s. Page says: %s" % (shot, snippet))
+
     async def _trigger_send(self, page, prompt: str) -> None:
         ta = await page.query_selector("textarea")
         if ta is None:
@@ -475,7 +500,23 @@ class _BrowserSession:
             logger.warning("prompt %d chars exceeds duck.ai limit %d; truncating (head+tail kept)",
                            len(prompt), limit)
             prompt = _clamp_prompt(prompt, limit)
+        for _ in range(10):  # a loading page may enable the box within a few seconds
+            if await ta.is_enabled():
+                break
+            await page.wait_for_timeout(500)
+        else:
+            await self._explain_disabled_composer(page)
         await ta.click()
+        if os.getenv("DUCKAI_DEBUG_PROMPT") == "1":  # opt-in debugging aid
+            try:
+                import time as _time
+                os.makedirs("debug", exist_ok=True)
+                _path = "debug/prompt-%d.txt" % int(_time.time() * 1000)
+                with open(_path, "w", encoding="utf-8") as _fh:
+                    _fh.write(prompt)
+                logger.warning("DUCKAI_DEBUG_PROMPT: wrote %s (%d chars)", _path, len(prompt))
+            except OSError:
+                pass
         await ta.fill(prompt)
         await page.wait_for_timeout(300)
         sent = False
@@ -664,6 +705,15 @@ class _RewriteRejected(DuckAIError):
     """Internal: rewritten body got ERR_CHALLENGE; retry once unmodified."""
 
 
+def _transport_dead(e: BaseException) -> bool:
+    """True when the error means the browser itself is gone (worth rebuilding and
+    retrying). A timeout or a disabled input is a page problem: retrying just
+    repeats it, so those fail fast instead."""
+    s = str(e).lower()
+    return any(k in s for k in ("has been closed", "target closed", "browser has been disconnected",
+                                "connection closed", "browser closed", "not connected"))
+
+
 class DuckAISession:
     """Thin pool over _BrowserSession; rotates on ban.
 
@@ -737,6 +787,7 @@ class DuckAISession:
 
     async def send(self, prompt: str, rewrite: Optional[dict] = None, max_rotations: int = 2) -> str:
         last_err: Optional[Exception] = None
+        rebuilt = False
         for _ in range(max(1, max_rotations)):
             idx = self._next_proxy_index()
             if idx is None:
@@ -749,20 +800,27 @@ class DuckAISession:
                 continue
             except DuckAIError:
                 raise
-            except Exception as e:  # playwright transport died - rebuild, surface as 502
+            except Exception as e:  # playwright transport died - rebuild, retry once
                 await self._sessions[idx]._reset()
+                if not rebuilt and _transport_dead(e):
+                    rebuilt = True
+                    logger.warning("browser transport failed (%s); rebuilt the browser, retrying once", e)
+                    continue
                 raise DuckAIError(f"browser transport failed: {e}")
         raise last_err or DuckAIRateLimit("all sessions failed")
 
     async def send_stream(self, prompt: str, rewrite: Optional[dict] = None, max_rotations: int = 2) -> AsyncIterator[str]:
         """Stream the assistant reply token-by-token (real incremental SSE)."""
         last_err: Optional[Exception] = None
+        rebuilt = False
+        yielded = False
         for _ in range(max(1, max_rotations)):
             idx = self._next_proxy_index()
             if idx is None:
                 raise DuckAIRateLimit("all sessions failed (Duck.ai ban)")
             try:
                 async for tok in (await self._session_for(idx)).send_stream_ui(prompt, self.timeout, rewrite):
+                    yielded = True
                     yield tok
                 return
             except DuckAIRateLimit as e:
@@ -773,6 +831,10 @@ class DuckAISession:
                 raise
             except Exception as e:
                 await self._sessions[idx]._reset()
+                if not rebuilt and not yielded and _transport_dead(e):
+                    rebuilt = True
+                    logger.warning("browser transport failed (%s); rebuilt the browser, retrying once", e)
+                    continue
                 raise DuckAIError(f"browser transport failed: {e}")
         raise last_err or DuckAIRateLimit("all sessions failed")
 

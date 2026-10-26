@@ -98,6 +98,100 @@ TOOL_ROUTING = os.getenv("DUCKAI_TOOL_ROUTING", "0").strip() == "1"
 PORT = int(os.getenv("PORT", "8080"))
 TOOL_RESULT_CAP = int(os.getenv("DUCKAI_TOOL_RESULT_CAP", "3000"))
 HOST = os.getenv("DUCKAI_HOST", "127.0.0.1")
+
+# Agent clients (opencode etc.) send ~10K chars of system prompt, which crowds
+# out Duck.ai's 12K window. With tools present we swap it for a short preamble.
+COMPACT_SYSTEM = os.getenv("DUCKAI_COMPACT_SYSTEM", "1") != "0"
+SYSTEM_KEEP = int(os.getenv("DUCKAI_SYSTEM_KEEP", "600"))
+_AGENT_PREAMBLE = (
+    "You are a coding agent working inside the user's project directory. "
+    "You have real access to the project through the tools described at the end "
+    "of this prompt: you can read, search and edit files and run shell commands. "
+    "Work step by step, one tool call at a time, and keep answers short."
+)
+
+
+def compact_system(original):
+    """Short agent preamble + the tail of the client's system prompt (where
+    environment info such as the working directory usually sits)."""
+    keep = ""
+    if original and SYSTEM_KEEP > 0:
+        tail = str(original)[-SYSTEM_KEEP:]
+        cut = tail.find("\n")
+        keep = (tail[cut + 1:] if 0 <= cut < len(tail) - 1 else tail).strip()
+    if keep:
+        return _AGENT_PREAMBLE + "\n\nClient context (from the original system prompt):\n" + keep
+    return _AGENT_PREAMBLE
+
+
+# --- agent loop guards (patch_agent_loop) ---------------------------------------------
+LOCAL_TITLES = os.getenv("DUCKAI_LOCAL_TITLES", "1") != "0"
+_NO_REPEAT = {t.strip() for t in os.getenv("DUCKAI_NO_REPEAT_TOOLS", "patch,edit,write").split(",") if t.strip()}
+
+
+def _seen_calls(messages) -> set:
+    """(tool name, canonical args) of every tool call already present in the history."""
+    seen = set()
+    for m in messages:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            fn = tc.get("function") or {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except ValueError:
+                continue
+            seen.add((fn.get("name", ""), json.dumps(args, sort_keys=True, ensure_ascii=False)))
+    return seen
+
+
+def _filter_calls(calls, seen) -> list:
+    """Collapse identical calls within one reply, and drop a repeat of a mutating call
+    (patch/edit/write by default) that already ran earlier in the conversation."""
+    kept, local = [], set()
+    for tc in calls:
+        key = (tc.name, json.dumps(tc.input, sort_keys=True, ensure_ascii=False))
+        if key in local:
+            continue
+        local.add(key)
+        if tc.name in _NO_REPEAT and key in (seen or ()):
+            logger.warning("dropped repeated %s call (it already ran earlier in this conversation)", tc.name)
+            continue
+        kept.append(tc)
+    return kept
+
+
+def _is_title_request(prompt: str) -> bool:
+    return "Reply with only the title" in prompt
+
+
+def _local_title(prompt: str) -> str:
+    import re
+    m = re.search(r"<message>\s*(.*?)\s*</message>", prompt, re.S)
+    words = (m.group(1) if m else prompt).split()[:6]
+    title = " ".join(words).strip(" .:;,-\"'`")
+    return title or "New session"
+
+
+def _local_title_response(request, prompt: str):
+    """Answer opencode's title request without spending a Duck.ai message."""
+    title = _local_title(prompt)
+    model = resolve_model(request.model)
+    cid = _id()
+    logger.info("LOCAL title %r (Duck.ai not called)", title)
+    if request.stream:
+        def chunk(delta, finish):
+            return "data: " + json.dumps({
+                "id": cid, "object": "chat.completion.chunk", "created": _created(), "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
+
+        async def gen():
+            yield chunk({"role": "assistant", "content": ""}, None)
+            yield chunk({"content": title}, None)
+            yield chunk({}, "stop")
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(gen(), media_type="text/event-stream")
+    return {"id": cid, "object": "chat.completion", "created": _created(), "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": title}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 _BOOT_TS = time.time()
 _active_requests = 0
 
@@ -431,7 +525,7 @@ async def _openai_stream(session: DuckAISession, prompt: str, model: str, chat_i
         err = {"error": {"message": f"stream failed: {e}", "type": "server_error"}}
         yield f"data: {json.dumps(err)}\n\n"
 
-async def _openai_agent_stream(session: DuckAISession, prompt: str, model: str, chat_id: str, rewrite: Optional[dict] = None):
+async def _openai_agent_stream(session: DuckAISession, prompt: str, model: str, chat_id: str, rewrite: Optional[dict] = None, seen=None):
     """Buffered OpenAI stream for tool-aware requests.
 
     Duck.ai output is parsed for tool-call envelopes BEFORE any chunk is sent,
@@ -461,10 +555,15 @@ async def _openai_agent_stream(session: DuckAISession, prompt: str, model: str, 
         return
 
     preamble, calls = split_text_and_tools("".join(buf))
+    if calls:
+        kept = _filter_calls(calls, seen)
+        if not kept:  # every call was a repeat: end the turn instead of looping
+            preamble = preamble or "Stopped: the model repeated a tool call that had already run (see the earlier result)."
+        calls = kept
     # Strict OpenAI clients expect the first chunk's delta to carry role.
     yield f"data: {json.dumps(chunk_obj({'role': 'assistant'}, None))}\n\n"
     if calls:
-        if preamble:
+        if preamble and os.getenv("DUCKAI_KEEP_PREAMBLE") == "1":  # off by default
             yield f"data: {json.dumps(chunk_obj({'content': preamble}, None))}\n\n"
         for i, tc in enumerate(calls):
             yield f"data: {json.dumps(chunk_obj({'tool_calls': [{'index': i, 'id': f'call_{uuid4().hex[:24]}', 'type': 'function', 'function': {'name': tc.name, 'arguments': json.dumps(tc.input, ensure_ascii=False)}}]}, None))}\n\n"
@@ -494,7 +593,12 @@ async def chat_completions(request: ChatCompletionRequest):
             text = text[:TOOL_RESULT_CAP] + "\n...[tool output truncated]"
         turns.append({"role": m.role, "content": text.strip(), "tool_call_id": m.tool_call_id or ""})
     system = "\n\n".join(systems) or None
+    if request.tools and COMPACT_SYSTEM:
+        system = compact_system(system)
     prompt = flatten_conversation(system, turns)
+    if LOCAL_TITLES and not request.tools and _is_title_request(prompt):
+        return _local_title_response(request, prompt)
+    seen_calls = _seen_calls(request.messages)
     # Teach Duck.ai the envelope protocol when the client advertises tools;
     # block goes last so head+tail truncation keeps it in the live context.
     agent_prompt = build_tool_aware_prompt(prompt, request.tools or [])
@@ -550,7 +654,7 @@ async def chat_completions(request: ChatCompletionRequest):
         # anything is emitted); plain chat keeps token-by-token streaming.
         if request.tools:
             return StreamingResponse(
-                _openai_agent_stream(session, agent_prompt, model, _id(), rewrite),
+                _openai_agent_stream(session, agent_prompt, model, _id(), rewrite, seen_calls),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )

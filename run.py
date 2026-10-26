@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import socket
@@ -38,6 +39,167 @@ def venv_python() -> Path | None:
         return exe
     exe = VENV / "bin" / "python"  # non-Windows layout
     return exe if exe.exists() else None
+
+
+def _duckapi_env_path():
+    from pathlib import Path
+    return Path(__file__).resolve().parent / ".env"
+
+
+def _duckapi_read_key():
+    """The API key the server will use: the environment wins, then .env."""
+    import os
+    key = os.getenv("DUCKAI_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        for line in _duckapi_env_path().read_text(encoding="utf-8").splitlines():
+            if line.startswith("DUCKAI_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def _duckapi_ensure_key():
+    """First-run setup: create .env and generate DUCKAI_API_KEY when there is none.
+
+    Never overwrites a key that is already set. DUCKAI_AUTOKEY=0 disables it.
+    """
+    import os, re, secrets, shutil
+    if os.getenv("DUCKAI_AUTOKEY", "1") == "0" or os.getenv("DUCKAI_API_KEY", "").strip():
+        return
+    path = _duckapi_env_path()
+    if not path.exists():
+        example = path.with_name("example.env")
+        if example.exists():
+            shutil.copyfile(example, path)
+        else:
+            path.write_text("", encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
+    m = re.search(r"^DUCKAI_API_KEY=(.*)$", text, re.M)
+    if m and m.group(1).strip().strip('"').strip("'"):
+        return
+    key = secrets.token_urlsafe(32)
+    if m:
+        text = text[:m.start()] + "DUCKAI_API_KEY=" + key + text[m.end():]
+    else:
+        text = text.rstrip("\n") + ("\n" if text.strip() else "") + "DUCKAI_API_KEY=" + key + "\n"
+    path.write_text(text, encoding="utf-8")
+    print("  first run : generated DUCKAI_API_KEY in .env")
+
+
+def _dashboard_url(port):
+    """Dashboard URL with the key in the fragment (never sent to the server)."""
+    from urllib.parse import quote
+    key = _duckapi_read_key()
+    base = f"http://localhost:{port}/"
+    return base + "#key=" + quote(key, safe="") if key else base
+
+
+# --- opencode registration (interactive merge; never writes without consent) ---
+OPENCODE_EXAMPLE = ROOT / "opencode.duck.example.json"
+
+
+def opencode_config_paths() -> list[Path]:
+    """Where the user's opencode config may live, in priority order."""
+    env_cfg = os.getenv("OPENCODE_CONFIG")
+    if env_cfg:  # opencode honors this override; never fall back past it
+        return [Path(env_cfg).expanduser()]
+    xdg = os.getenv("XDG_CONFIG_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
+    return [
+        base / "opencode" / "opencode.json",
+        base / "opencode" / "opencode.jsonc",
+        Path.home() / ".opencode.json",
+    ]
+
+
+def _relay_provider(cfg: dict, port: int):
+    """An existing provider entry pointed at THIS relay (same host and port)."""
+    for key, prov in (cfg.get("provider") or {}).items():
+        u = str(((prov or {}).get("options") or {}).get("baseURL", ""))
+        if u and f":{port}" in u and any(h in u for h in ("//localhost", "//127.0.0.1")):
+            return key
+    return None
+
+
+def opencode_sync(port: int = 8080) -> None:
+    """Offer to register this relay in the user's opencode config.
+
+    The provider block comes from opencode.duck.example.json (single source
+    of truth). Merging means: create the 'duckapi' provider, or append the
+    missing models to an existing provider already pointed at this relay.
+
+    Consent comes before any write: the prompt says exactly what would be
+    added, [y/N] decides, and a non-interactive terminal only gets the
+    manual command. Already-synced configs make the function a silent no-op,
+    so booting the relay stays quiet. The user's other providers, their
+    default model, and tool settings are never touched.
+    """
+    try:
+        example = json.loads(OPENCODE_EXAMPLE.read_text(encoding="utf-8"))
+        example_provider = (example.get("provider") or {}).get("duckapi") or {}
+        wanted = example_provider.get("models") or {}
+        if not wanted:
+            return
+    except (OSError, ValueError):
+        return
+
+    path = next((p for p in opencode_config_paths() if p.exists()), None)
+    if path is None:
+        return  # no opencode config anywhere: don't invent one
+
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        print(f"  opencode  : {path} is not parseable JSON (comments?) -"
+              " merge the relay's models in by hand (see opencode.duck.example.json)")
+        return
+
+    existing = _relay_provider(cfg, port)
+    if existing:
+        models = cfg["provider"][existing].setdefault("models", {})
+        missing = {m: spec for m, spec in wanted.items() if m not in models}
+        if not missing:
+            return  # nothing to do; stay silent on every boot
+        verb = f"add {', '.join(sorted(missing))} to provider '{existing}'"
+
+        def merge():
+            models.update(missing)
+    else:
+        verb = f"register provider 'duckapi' ({', '.join(sorted(wanted))})"
+
+        def merge():
+            cfg.setdefault("provider", {})["duckapi"] = dict(example_provider)
+
+    if not sys.stdin.isatty():
+        print(f"  opencode  : {path} needs an update ({verb}) - run interactively")
+        print("              to be asked, or merge by hand:")
+        print(f"                python3 add_opencode_models.py {path}")
+        return
+
+    print(f"  opencode  : {path}")
+    print(f"              would {verb} so opencode can reach this relay.")
+    print("              nothing else in the file changes.")
+    try:
+        answer = input("              merge now? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer not in ("y", "yes"):
+        print("  opencode  : skipped. merge later with:")
+        print(f"                python3 add_opencode_models.py {path}")
+        return
+
+    backup = path.with_name(path.name + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+    shutil.copyfile(path, backup)
+    merge()
+    path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    print(f"  opencode  : merged into {path} (backup: {backup.name})")
+    print("              opencode needs DUCKAI_API_KEY exported at launch (hint printed below).")
+
+
+_duckapi_ensure_key()
 
 
 def port_busy(port: int, host: str = "127.0.0.1") -> bool:
@@ -104,13 +266,15 @@ def serve(py: Path, port: int, reload: bool) -> int:
     """
     cmd = [
         str(py), "-m", "uvicorn", "main:app",
-        "--host", "0.0.0.0", "--port", str(port),
+        "--host", os.getenv("DUCKAI_HOST", "127.0.0.1"), "--port", str(port),
     ]
     if reload:
         cmd.append("--reload")
 
     print(f"Starting uvicorn on port {port}...")
     print(f"  dashboard : http://localhost:{port}/")
+    print("  api key   : stored in .env (DUCKAI_API_KEY); the dashboard tab opens with it filled in")
+    print("  opencode  : export DUCKAI_API_KEY=$(grep '^DUCKAI_API_KEY=' .env | cut -d= -f2-)")
     print(f"  log file  : {LOG}")
 
     # Truncate rather than append: one run's log is one run's story, and a
@@ -159,11 +323,13 @@ def main() -> int:
         print(f"Port {args.port} is free. Setup OK.")
         return 0
 
+    opencode_sync(args.port)
+
     # Open the dashboard only once the server actually answers, so the browser
     # never lands on a connection-refused page during the ~10s prewarm.
     if not args.no_browser and not args.reload:
         threading.Thread(
-            target=lambda: (wait_healthy(args.port) and webbrowser.open(f"http://localhost:{args.port}/")),
+            target=lambda: (wait_healthy(args.port) and webbrowser.open(_dashboard_url(args.port))),
             daemon=True,
         ).start()
 

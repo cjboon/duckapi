@@ -1,216 +1,202 @@
-<div align="center">
+# DuckBridge
 
-# DuckAI2API
+**Duck.ai's free models as a local OpenAI- and Anthropic-compatible API — built for coding agents.**
 
-**An OpenAI- and Anthropic-compatible API for Duck.ai — driven by a real Chrome browser.**
+Duck.ai has no public API. This project launches a real browser — your installed
+Chromium or Chrome, driven by [Playwright](https://playwright.dev/) — operates
+Duck.ai's ordinary web page, and exposes what comes back as standard `/v1`
+endpoints. Any OpenAI- or Anthropic-compatible client (OpenCode, Claude Code,
+the SDKs, plain `curl`) points at `http://127.0.0.1:8080` and talks to the
+site's models as if they were an ordinary hosted API.
 
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688.svg)](https://fastapi.tiangolo.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Playwright](https://img.shields.io/badge/Playwright-1.49-2ead63.svg)](https://playwright.dev/)
+It also generates images, and ships a small web dashboard for status, logs,
+and a playground.
 
-</div>
-
----
-
-## What this is
-
-Duck.ai has no public API. This project opens the real site in a real Chrome
-browser via [Playwright](https://playwright.dev/), types your prompt into the
-composer, and streams the answer back — then repackages it as a standard
-`/v1/chat/completions` endpoint. Any OpenAI-compatible client (or Claude Code,
-via the Anthropic-compatible route) can talk to it with nothing but a base URL.
-
-It also generates images, and ships with a web dashboard so you can watch
-latency, sessions, and logs live.
+This is unofficial automation of a consumer website. See
+[Cautions](#cautions) before putting traffic through it.
 
 ---
 
-## Before you use this
+## Why this exists
 
-Read this section before you install anything.
-
-**This is an unofficial project. It is not affiliated with, endorsed by, or
-sponsored by Duck.ai or DuckDuckGo.**
-
-Duck.ai publishes no public API. This project works by driving the ordinary
-web interface in a real browser — it types into the composer and reads the
-page. That is automation of a consumer site, which is exactly the kind of thing
-terms of service tend to prohibit. Whether you may do it is between you and
-Duck.ai, not something this README can grant you. **If using it would violate
-Duck.ai's Terms of Service, or the law where you live, don't use it.**
-
-Concretely, you accept that:
-
-- **You can be banned, and the ban is permanent.** Duck.ai bans by IP. A ban
-  means `418 ERR_BN_LIMIT` on every future request, with no `Retry-After` and
-  no cooldown. Nobody can lift it for you. If Duck.ai bans the IP you run this
-  from, that is your problem to solve, and it may be unsolvable.
-- **Bans can land on people who did nothing.** On shared, mobile, campus, or
-  corporate IPs, someone else's volume can get your address blocked.
-- **The browser is the real product.** If Duck.ai changes its page, this breaks.
-  It breaks on their schedule, not yours, and there is no support SLA.
-- **"Free" is not a licence.** That Duck.ai costs you nothing to use does not
-  make automated use permitted. Don't read an absence of restriction as consent.
-- **The maintainers accept no liability** for bans, blocked accounts, lost
-  access, or any claim arising from your use of this. See [License](#license).
-
-If any of that is a problem for you, the honest answer is: don't run this at
-volume, and don't run it on an IP you can't afford to lose. If you need a
-supported API, use a provider that offers one.
+- Coding agents already speak the OpenAI and Anthropic protocols; Duck.ai
+  speaks neither.
+- Between them sits this relay: prompt flattening, tool-call bridging, browser
+  sessions that stay alive per model, and session reuse that keeps multi-turn
+  agents fast.
+- The design goal throughout: make agent clients work *reliably*, not just
+  demonstrably — envelopes must parse, repeats must not loop, history must
+  round-trip, and failures must be diagnosable from logs rather than guessed.
 
 ---
 
-## Features
-
-- **OpenAI-compatible** — `POST /v1/chat/completions`, `GET /v1/models`, streaming
-  and non-streaming
-- **Anthropic-compatible** — `POST /v1/messages` and `POST /v1/responses`, so
-  Claude Code and other Anthropic-shaped clients work unchanged
-- **Image generation** — `POST /v1/images/generations` via Luna's native
-  GenerateImage tool
-- **Web dashboard** — live status, a chat/image playground, log tail, and model
-  catalog at `http://localhost:8080/`
-- **Session reuse** — keeps the Duck.ai conversation alive between turns and
-  types only the *delta*, which is roughly **2.5× faster** than resending
-  (measured ~3s/turn vs ~10s/turn)
-- **Challenge-aware warmup** — polls until Duck.ai is actually ready instead of
-  sleeping a fixed 7 seconds; first token drops from ~10.2s to ~5.5s
-- **Proxy pool** — rotates across a list of clean exits when one gets banned
-- **Credential masking** — proxy passwords are never exposed via the API
-- **Graceful shutdown** — the Stop button drains in-flight streams before
-  closing browsers
-- **Zero build step** — pure HTML/CSS/JS, no npm, no CDN
-
----
-
-## Requirements
-
-| | |
-|---|---|
-| **Python** | 3.10 or newer (developed on 3.13) |
-| **Chrome** | Installed. Playwright drives your existing Chrome, it does not bundle a browser |
-| **OS** | Windows, macOS, or Linux |
-
----
-
-## Installation
-
-### 1. Clone and set up
+## Quick start
 
 ```bash
-git clone https://github.com/hirotomasato/duckapi.git
-cd duckapi
+git clone https://github.com/cjboon/duckbridge.git
+cd duckbridge
 python run.py
 ```
 
-That is the whole install. `run.py` creates a virtualenv, installs
-`requirements.txt`, seeds `.env` from `example.env`, and starts the server —
-then opens the dashboard when it's healthy.
+That is the whole install. On first run it creates a virtualenv, installs
+`requirements.txt`, seeds `.env` from `example.env`, and generates a random
+`DUCKAI_API_KEY` (unless one is already set, or `DUCKAI_AUTOKEY=0`). It then
+starts uvicorn as a child process, tees output to `server.log` and the console,
+and opens the dashboard once `/health` passes.
 
-The venv is created on **first run only**; later runs reuse it untouched.
-
-### 2. Configure
-
-`.env` was copied from `example.env`. The defaults work out of the box. The one
-setting worth changing:
-
-```ini
-DUCKAI_API_KEY=pick-a-long-random-string
-```
-
-> **Set this before exposing the server to a network.** The default is empty,
-> which means open access to chat, images, and the dashboard. The server binds
-> `0.0.0.0`, so anything on your LAN can reach it. See
-> [Security](#security).
-
-### 3. Use it
-
-Point any OpenAI-compatible client at `http://localhost:8080/v1`:
+Smoke test (`export` is the same line `run.py` prints at startup):
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $DUCKAI_API_KEY" \
-  -d '{
-    "model": "gpt-5.6-luna",
-    "messages": [{"role": "user", "content": "Say PONG"}],
-    "stream": true
-  }'
-```
-
-Or open the dashboard at <http://localhost:8080/> and use the playground.
-
----
-
-## Running
-
-```bash
-python run.py                  # start, open the dashboard when healthy
-python run.py --no-browser     # start headless
-python run.py --port 9000      # different port
-python run.py --reload         # uvicorn autoreload, for development
-python run.py --check          # verify setup and port, don't boot
-```
-
-Output is teed to `server.log` **and** the console. The log is truncated on
-each start, so one run's log is one run's story.
-
-Manual alternative, if you prefer:
-
-```bash
-# Windows
-.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
-
-uvicorn main:app --host 0.0.0.0 --port 8080
+export DUCKAI_API_KEY=$(grep '^DUCKAI_API_KEY=' .env | cut -d= -f2-)
+curl -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer $DUCKAI_API_KEY" -d '{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"Say PONG"}]}'
 ```
 
 ---
 
-## Configuration
+## Using it with OpenCode
 
-All variables live in `.env`. Copy from `example.env` — it documents each one.
+1. Start the relay (`python run.py`). At startup it checks the opencode
+   config (`OPENCODE_CONFIG`, then `~/.config/opencode/opencode.json[c]`)
+   and offers to merge in the relay's provider — naming exactly what would
+   be added and asking `[y/N]`. Nothing is written without a yes; a
+   timestamped backup is made first; only the relay's own provider/model
+   entries are touched, the rest of the config stays as-is. Already-in-sync
+   configs make this a silent no-op.
+2. Launch opencode with the relay's key exported — the same line `run.py`
+   prints at every start:
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `DUCKAI_API_KEY` | *(empty)* | Bearer token for all `/v1/*` and `/api/*`. **Empty = open access** |
-| `DUCKAI_BASE` | `https://duck.ai` | Upstream host |
-| `DUCKAI_PROXIES` | *(empty)* | Comma-separated proxy pool, rotated on ban |
-| `DUCKAI_PROXY` | *(empty)* | Single proxy, if you don't need a pool |
-| `DUCKAI_WARM_MIN` | `2.0` | Hard floor, in seconds, for page warmup |
-| `DUCKAI_WARM_MAX` | `7.0` | Deadline for the readiness poll |
-| `DUCKAI_PREWARM` | `1` | Warm a browser at startup instead of on first request |
-| `DUCKAI_CHROME_PATH` | *(auto)* | Override the Chrome binary |
-| `DUCKAI_MODEL` | `gpt-5.6-luna` | Default model when the client omits one |
-| `DUCKAI_NEW_CHAT` | `0` | `0` reuses the session (fast); `1` forces a fresh chat per request |
-| `DUCKAI_TOOL_ROUTING` | `0` | Experimental intent→tool synthesis. **Off** — see below |
-| `PORT` | `8080` | Server port |
+   ```bash
+   export DUCKAI_API_KEY=$(grep '^DUCKAI_API_KEY=' /path/to/duckbridge/.env | cut -d= -f2-)
+   ```
+3. Pick a model with `/models` — `duckapi/gpt-5.6-luna` is the registered
+   default. Opencode's other providers (including its free models) are
+   untouched and remain available as usual.
 
-### Proxies and bans
+The provider block this merge writes lives in
+`opencode.duck.example.json`. To do it by hand instead — same result as the
+startup prompt, plus a timestamped backup:
 
-Duck.ai issues a **persistent per-IP ban** — you get `418 ERR_BN_LIMIT` on the
-very next request, with no `Retry-After` and no cooldown. The only real fix is
-a pool of clean exits. Residential and SOCKS5 proxies work best; datacenter IPs
-get banned fast.
-
-This section is about diagnosing an IP that is *already* blocked, not about
-avoiding bans. Read [Before you use this](#before-you-use-this) first — a proxy
-pool changes whose problem a ban is, not whether you have one.
-
-```ini
-DUCKAI_PROXIES=http://user:pass@host1:8080,socks5://host2:1080
+```bash
+python3 add_opencode_models.py ~/.config/opencode/opencode.jsonc [model-id ...]
 ```
 
-Credentials in this string are masked everywhere they're echoed back
-(`***@host:port`), so they never leak through the API or the dashboard.
+It appends any missing models to the provider whose `baseURL` points at the
+relay's port, with right-sized limits.
 
-> **Turning `DUCKAI_TOOL_ROUTING` on is a gamble.** It returns synthesized
-> `tool_calls` without calling Duck.ai at all. Agent clients (Claude Code,
-> WorkBuddy) always send a tools array plus a large context, and a mis-hit
-> yields `content: null` — which the IDE reports as "no response from model".
-> It stays off by default for that reason.
+Notes on the merged provider:
+
+- `limit.context: 12000` reflects Duck.ai's composer cap (~12K characters).
+  Keeping it honest stops the agent from stuffing more in than can be typed.
+- The example disables no opencode tools. If a tool misbehaves through this
+  relay, disable it selectively with, e.g.:
+  `"tools": { "webfetch": false, "task": false, "todowrite": false,
+  "todoread": false }` — those four have historically caused the most
+  follow-up confusion here.
+
+## Using it with Claude Code
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ANTHROPIC_AUTH_TOKEN=$DUCKAI_API_KEY
+```
+
+`/v1/messages` speaks the Anthropic Messages shape — streamed, with `tool_use`
+content blocks for tool calls.
+
+## Any OpenAI-compatible client
+
+Base URL `http://127.0.0.1:8080/v1`, key from `.env`. Streaming and
+non-streaming both work; tool calls arrive as ordinary `tool_calls` blocks.
+
+---
+
+## How it works
+
+1. A request hits `/v1/chat/completions`, `/v1/messages`, or `/v1/responses`;
+   its messages are flattened into a single role-labelled prompt. Duck.ai's
+   page is one textarea, so context must arrive in the message body — the
+   full conversation is re-sent every turn, all turns preserved.
+2. A per-model browser session is created on demand: a real browser tab
+   pointing at Duck.ai, launched headless with the binary at
+   `DUCKAI_CHROME_PATH` (this deployment: `/usr/bin/chromium`; the code
+   otherwise falls back to system Chrome). Untracked profile, `navigator.webdriver`
+   hidden, a real user-agent.
+3. The page is **warmed** until the site's own JS has finished booting — a
+   readiness poll (composer present + `WARM_MIN` floor, `WARM_MAX` deadline)
+   instead of a blind sleep.
+4. The driver types the prompt into the composer through the page's own UI
+   and clicks send. The site's app computes its challenge and request
+   context itself; a `fetch` hook installed in the page tees the response as
+   it streams (`clone().body.getReader()`), so tokens arrive as the page
+   actually produces them.
+5. **Session reuse**: a follow-up request's flattened prompt usually *extends*
+   the previous one (stateless agents re-send full history each turn). When
+   it does, only the delta is typed into the same live page — no re-warm, no
+   re-sending history. Anything else falls back to a fresh warmed page with
+   the full flattened prompt. Either way the model sees the whole
+   conversation. Set `DUCKAI_NEW_CHAT=1` to force a fresh page per request.
+6. Tool-call envelopes in the reply are parsed and re-shaped into strict
+   OpenAI/Anthropic structures. That is the next section.
+
+### Agent tool bridging
+
+Agent clients demand function calling; Duck.ai has no tool-call API. Seven
+cooperating parts bridge the gap:
+
+1. **Protocol injection.** When a request advertises tools, a compact block
+   is appended to the flattened prompt describing the envelope format:
+
+   ```
+   <tool_call name="ToolName">
+   {"arg": "value"}
+   >
+   ```
+
+   plus the client's real tool list (names, one-sentence descriptions, JSON
+   schemas) and rules of use: only listed tools, exactly one JSON object per
+   envelope, several envelopes may chain one step, stop once a
+   `[tool_result]` answers the question. The block sits at the very end of
+   the prompt so head+tail truncation (see [Limitations](#limitations))
+   always keeps it in the live context.
+
+2. **Envelope parsing.** Replies are scanned for envelopes and converted into
+   strict OpenAI `tool_calls` / Anthropic `tool_use` blocks. The parser is
+   tolerant on purpose: a missing close tag, fenced JSON, quote-style
+   variants, and `>` characters inside JSON values all parse. Invalid
+   payloads are skipped rather than guessed — a partial argument object
+   would still run a tool.
+
+3. **Buffered agent streams.** With tools present, the full answer is
+   collected and parsed *before* anything is emitted, so a half-received
+   envelope can never leak into the transcript as plain text. Cost: the
+   first visible chunk arrives only after the model finishes its turn.
+   Plain (toolless) requests stream token-by-token the whole way.
+
+4. **Loop guards.** Agent clients re-send the whole history every turn, and
+   models repeat themselves. The relay collapses identical calls within one
+   reply, drops a repeat of a mutating call (`DUCKAI_NO_REPEAT_TOOLS`,
+   default `patch,edit,write`) that already ran earlier in the conversation,
+   suppresses pre-call chatter ("Added a docstring…") so the client's
+   history stays clean (`DUCKAI_KEEP_PREAMBLE=1` to restore forwarding), and
+   ends the turn with explanatory text if every emitted call was a repeat.
+
+5. **Local session titles.** opencode's "Reply with only the title" request
+   is answered locally with the first words of the message; no turn is spent
+   on it (`DUCKAI_LOCAL_TITLES=0` to disable).
+
+6. **Compact system prompts.** Agent clients ship ~10K-character system
+   prompts that crowd out the 12K window. When tools are present, the relay
+   swaps the system prompt for a short agent preamble plus the last
+   `DUCKAI_SYSTEM_KEEP` (600) characters of the client's own prompt (where
+   environment context usually sits). `DUCKAI_COMPACT_SYSTEM=0` to disable;
+   `DUCKAI_TOOL_RESULT_CAP` (3000) truncates oversized tool results per turn.
+
+7. **Intent routing (experimental, opt-in).** `DUCKAI_TOOL_ROUTING=1` adds a
+   relay-side regex that synthesizes a `tool_calls` block straight from the
+   user's phrasing ("run `cmd`", "read README.md") without calling Duck.ai at
+   all. Off by default — a mis-hit yields `content: null`, which agents
+   report as "no response from model" — so treat it as a per-deployment
+   gamble.
 
 ---
 
@@ -220,75 +206,47 @@ Credentials in this string are masked everywhere they're echoed back
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/v1/chat/completions` | Streaming and non-streaming |
-| `GET` | `/v1/models` | Live catalog, falling back to a static list |
-| `POST` | `/v1/images/generations` | See [Images](#image-generation) |
+| `POST` | `/v1/chat/completions` | Streaming and non-streaming, tool calls |
+| `POST` | `/v1/responses` | OpenAI Responses shape, incl. `function_call` output items |
+| `GET` | `/v1/models` | Live catalog (`/duckchat/v1/models`), static snapshot as fallback |
+| `POST` | `/v1/images/generations` | See [Image generation](#image-generation) |
 | `GET` | `/v1/images/content/{id}` | Fetch a generated image by id |
 
 ### Anthropic-compatible
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/v1/messages` | Anthropic Messages shape |
-| `POST` | `/v1/responses` | OpenAI Responses shape |
+| `POST` | `/v1/messages` | Anthropic Messages shape, streaming + `tool_use` |
 
 ### Dashboard
 
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/` | The dashboard |
-| `GET` | `/api/status` | Uptime, sessions, ban flags, page age |
+| `GET` | `/api/status` | Uptime, sessions, page age, per-session state |
 | `GET` | `/api/logs` | Ring-buffer tail, last 500 records |
-| `POST` | `/api/chat` | Streaming playground chat |
+| `POST` | `/api/chat` | Streaming playground chat (reports first-token vs total) |
 | `POST` | `/api/images` | Playground image generation |
 | `GET` | `/api/models` | Catalog for the UI |
 | `POST` | `/api/shutdown` | Stop the server from the UI |
 | `GET` | `/health` | Liveness probe |
 
-Interactive API docs are at `/docs` while the server is running.
+Interactive docs at `/docs` while the server runs.
 
-### Client configuration
-
-<details>
-<summary><b>OpenAI SDK (Python)</b></summary>
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:8080/v1", api_key="your-key")
-stream = client.chat.completions.create(
-    model="gpt-5.6-luna",
-    messages=[{"role": "user", "content": "Say PONG"}],
-    stream=True,
-)
-for chunk in stream:
-    print(chunk.choices[0].delta.content or "", end="", flush=True)
-```
-</details>
-
-<details>
-<summary><b>Claude Code</b></summary>
-
-```bash
-ANTHROPIC_BASE_URL=http://localhost:8080
-ANTHROPIC_AUTH_TOKEN=your-key
-```
-</details>
-
-<details>
-<summary><b>OpenAI-compatible GUI (Chatbox, LobeChat, …)</b></summary>
-
-Set the provider's API host to `http://localhost:8080/v1` and paste your key.
-Because sessions are reused by default, the conversation is kept server-side
-per model, so "new chat" in the GUI maps to a fresh Duck.ai page.
-</details>
+The dashboard's **Stop** button drains in-flight streams (it counts the last
+`http.response.body` of each request via a pure-ASGI middleware, because
+Starlette's own middleware releases *before* a StreamingResponse finishes and
+would exit mid-answer), closes the browsers, then exits. It can stop the
+server; nothing can start it — a page served by a dying process disappears
+with it. Starting is `python run.py`.
 
 ---
 
 ## Models
 
-Models resolve through a live catalog with a static snapshot as fallback. Any
-alias below works as input; the real id is what `/v1/models` returns.
+Models resolve through a live catalog fetched from the public
+`/duckchat/v1/models` (1-hour TTL), with a static list as fallback. Any alias
+below works as input; the real id is what `/v1/models` returns.
 
 | Model | Label |
 |---|---|
@@ -303,30 +261,23 @@ alias below works as input; the real id is what `/v1/models` returns.
 | `tinfoil/gpt-oss-120b` | gpt-oss 120B |
 | `tinfoil/gemma4-31b` | Gemma 4 31B |
 
-**Aliases.** Common OpenAI and Anthropic names map onto whatever is closest, so
-existing configs keep working: `gpt-4o` → `gpt-5.4-mini`, `gpt-4o-mini` →
-`gpt-5.4-mini`, `o3-mini` → `gpt-5.4-mini`, `claude-3-5-sonnet` →
-`claude-sonnet-4-6`, `claude-3-opus` → `claude-opus-4-8`, `claude-3-haiku` →
-`claude-haiku-4-5`, `gpt-oss-120b` → `tinfoil/gpt-oss-120b`, `gemma4-31b` →
-`tinfoil/gemma4-31b`.
-
-> `gpt-5.4` left the catalog on 2026-09-18; the alias now resolves to
-> `gpt-5.4-mini`, its surviving sibling.
-
-`GET /v1/models` reflects whatever Duck.ai currently offers — the table above is
-the snapshot, not a guarantee.
+Aliases: `gpt-4o`, `gpt-4o-mini`, `o3-mini` → `gpt-5.4-mini`;
+`claude-3-5-sonnet` → `claude-sonnet-4-6`; `claude-3-opus` →
+`claude-opus-4-8`; `claude-3-haiku` → `claude-haiku-4-5`; `gpt-image-1`,
+`gpt-image-2`, `dall-e-3` → `gpt-5.6-luna` (image generation). Unknown ids
+pass through, so a new Duck.ai model works before this table is updated.
 
 ---
 
 ## Image generation
 
-Duck.ai has no standalone image API. This drives an ordinary chat turn that
-makes the model invoke its **native GenerateImage tool** (backend "GPT Image 2"),
-then returns the resulting base64 JPEG. `gpt-image-1`, `gpt-image-2`, and
-`dall-e-3` all alias onto `gpt-5.6-luna`.
+Duck.ai has no standalone image API. The relay drives an ordinary chat turn
+that makes the model invoke its native **GenerateImage** tool (backend
+"GPT Image 2", surfaced through `gpt-5.6-luna`), then returns the base64 JPEG
+from the SSE success-frame.
 
 ```bash
-curl http://localhost:8080/v1/images/generations \
+curl http://127.0.0.1:8080/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $DUCKAI_API_KEY" \
   -d '{
@@ -338,21 +289,59 @@ curl http://localhost:8080/v1/images/generations \
   }'
 ```
 
-Returns `url` (a local id you can `GET`) or `b64_json` depending on
-`response_format`. **`n` is capped at 4**, and each image takes **15–20s** —
-they are generated sequentially.
+- `response_format: "url"` returns a stable local URL. A browser cannot
+  attach an auth header to an `<img src>`, so `/v1/images/content/{id}` also
+  accepts `?key=`; ids are unguessable uuid4 prefixes — a second path to the
+  same secret, not a hole in it.
+- `b64_json` returns the raw bytes inline.
+- `n` is capped at 4; each image takes **15–20s**, generated sequentially.
+- Images live in an in-memory cache (last 50). Restarting drops them.
+- In the dashboard: switch the composer to **Image** mode — the model picker
+  becomes a size picker and results render inline.
 
-Images are cached in memory (last 50) purely so `response_format: "url"` can
-hand back a stable local URL. Restarting the server drops them.
+---
 
-In the dashboard, switch the composer to **Image** mode. The model picker is
-replaced by a size picker, and results render inline in the conversation.
+## Configuration
+
+All settings live in `.env`, seeded from `example.env`, which documents each
+one.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DUCKAI_API_KEY` | *(auto-generated)* | Bearer token for `/v1/*` and `/api/*`. Empty = open access |
+| `DUCKAI_BASE` | `https://duck.ai` | Upstream host |
+| `DUCKAI_CHROME_PATH` | *(auto)* | Browser binary (your Chromium or Chrome; falls back to system Chrome) |
+| `DUCKAI_MODEL` | `gpt-5.6-luna` | Default model when the client omits one |
+| `DUCKAI_NEW_CHAT` | `0` | `0` reuses the session (fast) · `1` = fresh chat per request |
+| `DUCKAI_PREWARM` | `1` | Warm browser+page at startup instead of first request |
+| `DUCKAI_WARM_MIN` | `2.0` | Hard floor for page warmup, seconds |
+| `DUCKAI_WARM_MAX` | `7.0` | Deadline for the readiness poll, seconds |
+| `DUCKAI_PROXY` | *(empty)* | Single proxy (`http`/`https`/`socks5`) |
+| `DUCKAI_PROXIES` | *(empty)* | Proxy pool, comma-separated; rotates on rate-limit/ban responses |
+| `DUCKAI_TOOL_ROUTING` | `0` | Experimental intent→tool synthesis |
+| `DUCKAI_TOOL_RESULT_CAP` | `3000` | Max chars of a tool result fed back per turn |
+| `DUCKAI_TOOL_BLOCK_CAP` | `6000` | Max chars of injected tool-protocol text |
+| `DUCKAI_COMPACT_SYSTEM` | `1` | Swap agent system prompts for a short preamble |
+| `DUCKAI_SYSTEM_KEEP` | `600` | Tail of the client system prompt to keep |
+| `DUCKAI_LOCAL_TITLES` | `1` | Answer session-title requests locally |
+| `DUCKAI_NO_REPEAT_TOOLS` | `patch,edit,write` | Mutating calls not allowed to repeat |
+| `DUCKAI_KEEP_PREAMBLE` | `0` | `1` = forward text emitted before tool calls |
+| `DUCKAI_DEBUG_PROMPT` | `0` | `1` = dump typed prompts to `debug/prompt-*.txt` |
+| `DUCKAI_HOST` | `127.0.0.1` | Bind address |
+| `PORT` | `8080` | Server port |
+
+The server binds `127.0.0.1` for a reason: if you change `DUCKAI_HOST`, set
+`DUCKAI_API_KEY` first. With an empty key the server is open to whatever can
+reach it, and there is no rate limiting — you would be the one paying for
+what runs through your IP. Proxy credentials are masked (`***@host:port`)
+everywhere they are echoed — API responses, dashboard, and logs never see
+them.
 
 ---
 
 ## Performance
 
-Measured live against Duck.ai on 2026-09-29:
+Measured against Duck.ai previously:
 
 | | Before | After |
 |---|---|---|
@@ -360,93 +349,114 @@ Measured live against Duck.ai on 2026-09-29:
 | Per turn, session reuse | 10.3s | **~3s** |
 
 Two changes get you there. **Warmup** polls until the page is genuinely ready
-instead of sleeping a fixed 7s, so a fast page skips straight ahead. **Session
-reuse** keeps the Duck.ai conversation alive and types only the delta of your
-prompt rather than the whole flattened transcript — which is also why the
-12,000-character composer cap is rarely hit in practice.
-
-Set `DUCKAI_PREWARM=1` to move browser startup into server boot, so the very
-first caller skips the ~10s setup too.
-
----
-
-## Troubleshooting
-
-**`418 ERR_BN_LIMIT` on the first request** — your IP is banned, and it is
-persistent. Configure `DUCKAI_PROXIES`. There is no cooldown to wait out.
-
-**Chrome fails to launch** — Playwright drives your installed Chrome. Set
-`DUCKAI_CHROME_PATH` if it lives somewhere non-standard, or verify it runs as
-your user.
-
-**Port 8080 already in use** — `run.py` refuses to start and tells you. Use
-`python run.py --port 8081`.
-
-**Empty or garbled answers** — check the **Logs** tab in the dashboard. A ban
-looks like an empty response, not an error.
-
-**The dashboard can't stop the server after a crash** — expected, and not a
-bug. A page served by a process disappears when that process dies, so there is
-nothing left to click. Restart with `python run.py`. This is a direct
-consequence of having no external launcher.
-
-**First request is slow** — that's prewarm. Set `DUCKAI_PREWARM=1`, or just send
-a throwaway message first.
+instead of sleeping a fixed 7s. **Session reuse** types only the delta of the
+follow-up prompt, which is also why the composer cap is rarely hit in
+practice. `DUCKAI_PREWARM=1` (default) moves browser startup into server
+boot, so the very first caller skips the remaining setup. The dashboard's
+chat tab shows live first-token vs total per turn — the numbers are visible,
+not vibes.
 
 ---
 
-## Security
+## Debugging and diagnostics
 
-- Set `DUCKAI_API_KEY` before putting this on a network. The default is empty,
-  which is open access.
-- The server binds `0.0.0.0`. If you don't need LAN access, run it behind a
-  reverse proxy, or bind to localhost.
-- Proxy credentials are masked in every API response and in the dashboard.
-- **There is no rate limiting.** Do not expose this to the public internet —
-  you would be proxying Duck.ai through your IP, and you would be the one
-  paying for the bans.
-- The dashboard's Stop button and in-flight drain are intended for local use.
+- **`server.log`** — the durable record, teed to the console; truncated on
+  each start, so one run's log is one run's story.
+- **`/api/logs`** (or the **Logs** tab) — the last 500 records from an
+  in-memory ring buffer, so a failure is inspectable in the browser.
+- **`DUCKAI_DEBUG_PROMPT=1`** — dump exactly what gets typed into Duck.ai
+  *after* truncation, to `debug/prompt-<timestamp>.txt`. These files contain
+  whatever the client sent (file paths, project text) — review before
+  sharing and delete when done.
+- **`diag_duckai.py`** — what does Duck.ai show a fresh browser, same config
+  as the relay? Loads the page, prints URL/dialogs/buttons/textarea state,
+  saves `debug/diag.png`, sends nothing:
+
+  ```bash
+  .venv/bin/python diag_duckai.py            # visible window, waits for Enter
+  .venv/bin/python diag_duckai.py --headless # report + screenshot only
+  ```
+
+  A consent/limit dialog or a greyed-out composer explains a "message box is
+  disabled" failure in seconds instead of a hung send.
+- **`test_tools.py`** — live smoke test against the running relay: does the
+  model emit a valid tool call (`finish_reason: tool_calls`), and does
+  tool-result history round-trip into a grounded answer:
+
+  ```bash
+  .venv/bin/python test_tools.py [N=5] [model]
+  ```
+
+  Every run is a real Duck.ai request — keep N small.
+- **An error (418 / challenge) on every request, or an empty answer** —
+  the site is refusing your IP or fingerprint. `diag_duckai.py` shows which
+  case you're in. The supported mitigations: a proxy pool (`DUCKAI_PROXIES`)
+  and, if a particular browser build is getting flagged, pointing
+  `DUCKAI_CHROME_PATH` at a different one.
+- **`.bak` files / `patch_*.sh` / `.patch-backup/`** — provenance, not code.
+  The relay grew through small, idempotent, backup-first shell patches; the
+  timestamped snapshots show how each behavior came to be. Keep or delete
+  freely; nothing needs them.
+
+---
+
+## Cautions
+
+- **Unofficial automation of a consumer site.** Automation of the ordinary
+  web UI is the kind of thing terms of service tend to prohibit. Whether
+  your use is permitted is between you and Duck.ai, not something this
+  README can grant.
+- **Refusals are part of the terrain.** Duck.ai can rate-limit or block an
+  IP (observed as `418` / `ERR_CHALLENGE`-style errors), sometimes with no
+  cooldown or `Retry-After` — and on shared IPs, someone else's volume can
+  cause it. Proxy pools and a different browser binary are the mitigations
+  this project ships; waiting is not.
+- **The site is the product.** Duck.ai can change its page at any time, and
+  this breaks on their schedule, not yours.
+- **Don't expose it.** Binds `127.0.0.1`, no rate limiting, and a
+  `DUCKAI_API_KEY` you should set before changing that.
+
+---
+
+## Limitations
+
+- **One browser tab per model.** The tab holds live conversation state, so
+  sends to the same model serialize; different models run in parallel.
+- **Agent turns are buffered**, so "streaming" in tool mode arrives as one
+  chunk after generation completes.
+- **Prompt cap.** ~12,000 chars into the composer; long conversations are
+  clamped head+tail with a visible `[context truncated]` marker. Usage
+  counts in responses are zero — no upstream token accounting exists to
+  copy.
+- **Images are slow** — 15–20s each, sequential.
 
 ---
 
 ## Project layout
 
 ```
-duckapi/
+duckbridge/
 ├── run.py            # the only entry point: venv, deps, .env, uvicorn
-├── main.py           # FastAPI app, /v1/* routes, session lifecycle
-├── duckai.py         # Playwright driver, model catalog, warmup
+├── main.py           # FastAPI app, /v1/* routes, agent-loop guards
+├── duckai.py         # Playwright driver, model catalog, warmup, session reuse
+├── tools.py          # tool-call envelope parsing (tolerant)
+├── toolrouter.py     # protocol injection + experimental intent routing
 ├── dashboard.py      # dashboard + playground routes
-├── dashboard.html    # the UI — no build step
-├── tools.py          # tool-call extraction
-├── toolrouter.py     # experimental intent→tool synthesis
+├── dashboard.html    # the UI — pure HTML/CSS/JS, no build step
 ├── example.env       # documented config template
-└── requirements.txt
+├── requirements.txt
+├── diag_duckai.py    # fresh-browser diagnostic (same config as the relay)
+├── test_tools.py     # live tool-bridge smoke test
+├── add_opencode_models.py      # register relay models in an opencode config
+├── opencode.duck.example.json  # example opencode provider snippet
+└── patch_*.sh        # applied history patches (idempotent, backup-first)
 ```
-
----
-
-## How it works
-
-1. A request hits `/v1/chat/completions` and is flattened into a prompt.
-2. A per-model browser session is created on demand — a real Chrome, launched
-   with a throwaway profile so your own browsing is untouched.
-3. The page is warmed until Duck.ai has minted its challenge token.
-4. The prompt is typed into the composer and the SSE stream is parsed back into
-   tokens.
-5. If the previous turn is a prefix of this one, only the **delta** is typed —
-   the rest stays as native Duck.ai page history. That is the 2.5× speedup.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-The MIT license covers the source code, and nothing else. It is not a grant of
-rights from Duck.ai, and it cannot be — Duck.ai is not a party to it. Read
-[Before you use this](#before-you-use-this): the code is MIT-licensed, your use
-of Duck.ai through it is not something this project can license to you. You are
-responsible for complying with Duck.ai's terms of service and with the law in
-your jurisdiction. The maintainers accept no liability for bans, blocked
-accounts, or any use of this project.
+MIT — see [LICENSE](LICENSE). The MIT license covers the source code, and
+nothing else. It is not a grant of rights from Duck.ai, and it cannot be.
+Your use of Duck.ai through it is a matter of site terms and jurisdiction —
+not something this project can license.

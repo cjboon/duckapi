@@ -13,6 +13,9 @@ env/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Debug artifacts (screenshots, prompt dumps) — local only
+debug/
 .patch-backup/
 *.bak
 *.bak[0-9]

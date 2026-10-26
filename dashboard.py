@@ -24,7 +24,7 @@ from duckai import DuckAIRateLimit, DuckAIError
 HERE = Path(__file__).resolve().parent
 
 
-def _require_key(authorization: str = Header(default="")) -> None:
+def _require_key(request: Request, authorization: str = Header(default="")) -> None:
     """Same auth as the API surface.
 
     Header() is load-bearing: a bare `str` parameter is a *query* parameter to
@@ -38,6 +38,10 @@ def _require_key(authorization: str = Header(default="")) -> None:
     """
     from fastapi import HTTPException
     from main import API_KEY
+    # [patch_dashboard] The page itself holds no secrets and a browser cannot send
+    # a header when loading it; only the /api/* routes it calls need the key.
+    if request.method == "GET" and request.url.path == "/":
+        return
     if not API_KEY:
         return
     if not authorization.startswith("Bearer ") or authorization.split(" ", 1)[1] != API_KEY:
